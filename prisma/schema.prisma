@@ -343,7 +343,7 @@ model Booking {
 
   @@unique([userId, idempotencyKey])
   @@index([userId])
-  @@index([eventId])
+  @@index([eventId, createdAt])
   @@index([status, expiresAt])
   @@map("bookings")
 }

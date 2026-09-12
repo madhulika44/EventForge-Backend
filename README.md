@@ -289,14 +289,85 @@ payment/refund internals. A booking id that belongs to a different event returns
 | `STRIPE_WEBHOOK_SECRET` | No | Real Stripe webhook signing secret; omit to use the fake provider |
 | `REDIS_URL` | No (defaults to `redis://localhost:6379`) | Only read by `npm run worker` |
 
+## Production hardening (Phase 8)
+
+- **Request correlation**: every request gets a server-generated UUID (never a
+  client-supplied one, to prevent spoofing/collisions in logs), exposed as the
+  `X-Request-Id` response header and attached to `req.id`/`req.log` (via
+  `pino-http`). All structured logs — including the final catch-all in
+  `error.middleware.ts` — carry it, so one request's logs can be traced end to end.
+- **Security headers**: Helmet's defaults (CSP, `X-Content-Type-Options`,
+  `X-Frame-Options`, `Referrer-Policy`, etc.), plus an explicit `Permissions-Policy`
+  (Helmet doesn't set one) disabling camera/microphone/geolocation/payment, and HSTS
+  explicitly enabled only when `NODE_ENV=production` (it's meaningless over plain
+  HTTP in dev).
+- **Rate limiting**: in-memory (`express-rate-limit`, not Redis-backed — the API
+  server has never depended on Redis, and adding that coupling purely for rate
+  limiting isn't worth it for a single-instance deployment target; see
+  `src/middleware/rate-limit.middleware.ts` for the full tradeoff). Applied to
+  `/api/auth/register`, `/api/auth/login`, `/api/auth/refresh` (brute-force/
+  credential-stuffing protection) and `POST /api/bookings/:id/payment` (abuse of
+  payment-intent creation). Disabled entirely under `NODE_ENV=test`. Limits are
+  configurable — see the table below.
+- **CORS**: outside production, any origin is reflected (local frontend dev
+  convenience). In production, only origins listed in `CORS_ALLOWED_ORIGINS`
+  (comma-separated) are allowed, with credentials enabled; an empty/unset list
+  fails closed (no browser origin allowed) rather than open. Non-browser requests
+  (no `Origin` header) always pass through.
+- **Request body limits**: `express.json()` and the Stripe webhook's `express.raw()`
+  both cap body size via `REQUEST_BODY_LIMIT` (default `100kb`). An oversized body
+  returns `413 PAYLOAD_TOO_LARGE`; malformed JSON returns `400 INVALID_JSON` —
+  both handled explicitly in `error.middleware.ts` rather than falling through to a
+  generic 500.
+- **Health vs. readiness**: `GET /health` is a cheap liveness check (no auth, no
+  dependency checks — always answers if the process is up). `GET /ready` additionally
+  checks Postgres connectivity (the only dependency the API server itself owns —
+  Redis belongs only to the separate worker process) and returns `503 NOT_READY`
+  without leaking connection details if the database is unreachable.
+- **Graceful shutdown**: both `server.ts` and `worker.ts` handle `SIGINT`/`SIGTERM`
+  by stopping new work, closing existing connections/jobs, then disconnecting from
+  the database — with a 10-second failsafe timeout that force-exits if shutdown
+  hangs, and a guard against a second signal re-entering shutdown while the first
+  is still in progress.
+- **Error handling**: unexpected errors are logged in full (with the request id)
+  but only ever return a generic message to the client in production — no stack
+  traces, no raw Prisma error text, no internal detail ever reach the response body.
+- **Logging**: Pino redacts `Authorization`/`Cookie`/`Set-Cookie` headers and any
+  password/token fields; no log statement anywhere logs a raw password, token,
+  secret, or full payment payload.
+- **Database indexing**: reviewed against actual query patterns (not
+  speculatively) — `Booking`'s `eventId` index was widened to `(eventId, createdAt)`
+  to match its one real query (organizer booking list, filtered by event, sorted by
+  `createdAt DESC`). `Payment`/`Refund` were evaluated and left as-is: their
+  per-payment/per-refund row counts are too small (0-2 rows typically) for an
+  additional compound index to matter.
+
+### Environment variables (Phase 8 additions)
+
+| Variable | Required? | Purpose |
+| --- | --- | --- |
+| `CORS_ALLOWED_ORIGINS` | No (required in production to allow any browser origin) | Comma-separated allowlist of browser origins |
+| `AUTH_RATE_LIMIT_WINDOW_MS` | No (default `900000` / 15 min) | Window for auth endpoint rate limiting |
+| `AUTH_RATE_LIMIT_MAX` | No (default `10`) | Max auth attempts per window per IP |
+| `PAYMENT_RATE_LIMIT_WINDOW_MS` | No (default `60000` / 1 min) | Window for payment-creation rate limiting |
+| `PAYMENT_RATE_LIMIT_MAX` | No (default `10`) | Max payment-creation attempts per window per IP |
+| `REQUEST_BODY_LIMIT` | No (default `100kb`) | Max JSON/webhook request body size |
+
 ## Known trade-offs / accepted risks
 
-- `npm audit` reports vulnerabilities in Prisma's own transitive dependencies
-  (`deepmerge-ts`, `mysql2` — the latter unused since this project is PostgreSQL-only).
-  The suggested fix downgrades Prisma to an older line; given the low relevance of
-  the attack surface (local CLI config merging, not user-facing), the current
-  version was kept. Revisit when Prisma patches upstream.
+- `npm audit` reports 3 high-severity findings, all from `deepmerge-ts`, a
+  transitive dev-only dependency of the `prisma` CLI's config loader (a
+  stack-exhaustion DoS on crafted recursive input — not reachable through the
+  running API, since only `@prisma/client` ships to production, not the CLI). The
+  only available fix (`npm audit fix --force`) downgrades `prisma` itself to
+  6.12.0 as a breaking change; not worth taking on for a dev-tool-only,
+  non-user-facing vulnerability. Revisit when Prisma patches upstream.
 - Prisma is pinned to the 6.19.3 stable line rather than the newly-released 7.x,
   which requires a driver-adapter/`prisma.config.ts` setup instead of the
   traditional `url` in `schema.prisma`. That's real added complexity not worth
   taking on for this foundation phase.
+- Rate limiting is in-memory and per-process (see above) — limits reset on
+  restart and don't share state across horizontally-scaled instances. Acceptable
+  for the current single-instance deployment target; upgrading to a shared Redis
+  store (e.g. `rate-limit-redis`) behind the same `createRateLimiter` factory is a
+  contained change if that changes.

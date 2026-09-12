@@ -10,6 +10,25 @@ interface ApiErrorBody {
   error: { code: string; message: string };
 }
 
+interface HttpErrorLike {
+  status?: number;
+  type?: string;
+}
+
+/** body-parser (express.json/express.raw) throws plain objects shaped like
+ * this for a malformed or oversized body — not one of our own error types,
+ * so it needs its own duck-typed check rather than an instanceof. */
+function isHttpErrorLike(err: unknown): err is HttpErrorLike {
+  return typeof err === "object" && err !== null && ("status" in err || "type" in err);
+}
+
+/** Every request gets an id from pino-http's genReqId (see app.ts); this is
+ * the one place request-scoped logging happens outside pino-http's own
+ * automatic completion logs, so it must carry the same id for correlation. */
+function requestLogger(req: Request) {
+  return req.log ?? logger;
+}
+
 export function notFoundHandler(req: Request, res: Response): void {
   res.status(404).json({
     success: false,
@@ -31,6 +50,22 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     res.status(400).json({
       success: false,
       error: { code: "VALIDATION_ERROR", message: err.issues[0]?.message ?? "Invalid request" },
+    } satisfies ApiErrorBody);
+    return;
+  }
+
+  if (isHttpErrorLike(err) && err.type === "entity.too.large") {
+    res.status(413).json({
+      success: false,
+      error: { code: "PAYLOAD_TOO_LARGE", message: "Request body is too large" },
+    } satisfies ApiErrorBody);
+    return;
+  }
+
+  if (isHttpErrorLike(err) && err.type === "entity.parse.failed") {
+    res.status(400).json({
+      success: false,
+      error: { code: "INVALID_JSON", message: "Request body is not valid JSON" },
     } satisfies ApiErrorBody);
     return;
   }
@@ -68,7 +103,11 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
-  logger.error({ err, path: req.path, method: req.method }, "Unhandled error");
+  // Unexpected/programmer errors: logged with the full error (stack
+  // included) and the request id for correlation, but the client only ever
+  // sees a generic message in production — no stack traces, no Prisma
+  // internals, no raw error text ever reach the response body.
+  requestLogger(req).error({ err, path: req.path, method: req.method, requestId: req.id }, "Unhandled error");
 
   res.status(500).json({
     success: false,

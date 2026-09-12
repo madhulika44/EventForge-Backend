@@ -1,5 +1,4 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
 import {
   loginHandler,
   logoutHandler,
@@ -10,23 +9,20 @@ import {
 import { requireAuth } from "../middleware/auth.middleware";
 import { validateBody } from "../middleware/validate.middleware";
 import { loginSchema, registerSchema } from "../schemas/auth.schema";
+import { createRateLimiter } from "../middleware/rate-limit.middleware";
 import { env } from "../config/env";
 
 const router = Router();
 
-// Credential-guessing endpoints get a tighter limit than the rest of the API.
-// Disabled under NODE_ENV=test so the automated suite (many requests from
-// the same address) isn't throttled; it stays fully active in dev/production.
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: () => env.NODE_ENV === "test",
-  message: {
-    success: false,
-    error: { code: "TOO_MANY_REQUESTS", message: "Too many attempts, please try again later" },
-  },
+// Credential-guessing endpoints get a tighter limit than the rest of the
+// API. Window/max configurable via AUTH_RATE_LIMIT_WINDOW_MS/AUTH_RATE_LIMIT_MAX
+// (default: 10 attempts per 15 minutes per IP) — tight enough to slow down
+// brute-force/credential-stuffing attempts, loose enough that a legitimate
+// user mistyping their password a few times is never blocked.
+const authLimiter = createRateLimiter({
+  windowMs: env.AUTH_RATE_LIMIT_WINDOW_MS,
+  limit: env.AUTH_RATE_LIMIT_MAX,
+  message: "Too many attempts, please try again later",
 });
 
 router.post("/register", authLimiter, validateBody(registerSchema), registerHandler);
