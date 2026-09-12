@@ -30,6 +30,13 @@ enum TicketStatus {
   CLOSED
 }
 
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+}
+
 model User {
   id           String   @id @default(uuid()) @db.Uuid
   name         String
@@ -44,6 +51,7 @@ model User {
   refreshTokens RefreshToken[]
   events        Event[]
   venues        Venue[]
+  bookings      Booking[]
 
   @@map("users")
 }
@@ -106,6 +114,10 @@ model Event {
   // event (same reasoning as VenueSection -> Venue being Cascade rather
   // than Restrict).
   ticketTypes TicketType[]
+
+  // Restrict: a booking is purchase history and must never be silently
+  // destroyed by anything happening to its event.
+  bookings Booking[]
 
   @@index([organizerId])
   @@index([status, startDateTime])
@@ -220,6 +232,10 @@ model TicketType {
   // Restrict: see the comment on VenueSection.ticketTypes above.
   venueSection VenueSection? @relation(fields: [venueSectionId], references: [id], onDelete: Restrict)
 
+  // Restrict: a booking item is purchase history and must never be silently
+  // destroyed by anything happening to the ticket type it references.
+  bookingItems BookingItem[]
+
   // Prevents two same-named tiers on one event (e.g. two "VIP"s by mistake),
   // mirroring the VenueSection name-uniqueness precedent.
   @@unique([eventId, name])
@@ -242,8 +258,120 @@ model Seat {
 
   section VenueSection @relation(fields: [venueSectionId], references: [id], onDelete: Cascade)
 
+  // Restrict: a booking item is purchase history and must never be silently
+  // destroyed by anything happening to the seat it references. A seat can
+  // still be referenced by many BookingItems over time (one per historical
+  // booking) — what must never happen is two *active* bookings on it at
+  // once, which is enforced by the partial unique index described on
+  // BookingItem below, not by this relation.
+  bookingItems BookingItem[]
+
   // A seat should not be duplicated within the same section.
   @@unique([venueSectionId, rowLabel, seatNumber])
   @@index([venueSectionId])
   @@map("seats")
+}
+
+model Booking {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  // Denormalized on Booking (not on every BookingItem): a booking represents
+  // exactly one event's purchase, and storing it once here — enforced by the
+  // FK below plus a service-layer check that every item's ticket type
+  // actually belongs to this event — makes that invariant explicit and makes
+  // "list bookings for event X" a plain indexed query, without repeating
+  // eventId on each line item where it would be pure redundancy (already
+  // derivable via ticketType.eventId).
+  eventId String @db.Uuid
+
+  // Human-readable reference (e.g. "EVF-7K2M9XQP"), separate from the UUID
+  // id, for support/lookup/display purposes.
+  bookingReference String @unique
+
+  status BookingStatus @default(PENDING)
+
+  // Snapshotted once for the whole booking; the service rejects mixing
+  // ticket types with different currencies in a single booking, since
+  // summing across currencies without FX conversion is meaningless.
+  currency String
+
+  // Both persisted (not derived at read time): a booking's totals are a
+  // historical financial fact that must stay stable even if pricing logic
+  // changes later, exactly like BookingItem's price snapshot. total ==
+  // subtotal today (no fees/taxes yet) — kept as two fields now rather than
+  // one, matching the structure this phase was asked to consider, so that
+  // adding fees/taxes later (total = subtotal + fees) needs no schema change
+  // or backfill.
+  subtotal Decimal @db.Decimal(10, 2)
+  total    Decimal @db.Decimal(10, 2)
+
+  // Only meaningful while status = PENDING; the hold window during which
+  // this booking's inventory is considered reserved. Checked lazily (on
+  // read, on cancel, and before a competing booking claims the same
+  // inventory) rather than by a background job.
+  expiresAt DateTime?
+
+  // Optional client-supplied idempotency key, scoped per user: a repeated
+  // (userId, idempotencyKey) pair returns the original booking instead of
+  // creating a duplicate (protects against double-clicks/retries).
+  idempotencyKey String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Restrict: a booking is purchase history and must never be silently
+  // destroyed by anything happening to the user or event it references.
+  user  User  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  event Event @relation(fields: [eventId], references: [id], onDelete: Restrict)
+
+  items BookingItem[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId])
+  @@index([eventId])
+  @@index([status, expiresAt])
+  @@map("bookings")
+}
+
+model BookingItem {
+  id           String @id @default(uuid()) @db.Uuid
+  bookingId    String @db.Uuid
+  ticketTypeId String @db.Uuid
+
+  // Null for General Admission; set for a specific physical seat. GA items
+  // may have quantity > 1; a seat-linked item must have quantity == 1
+  // (enforced by a CHECK constraint added via raw SQL in the migration,
+  // since the Prisma schema DSL has no declarative CHECK syntax).
+  seatId   String? @db.Uuid
+  quantity Int
+
+  // Immutable snapshots taken from TicketType.price/currency at the moment
+  // of booking — see the Phase 5 report for why this must never be
+  // recalculated from the current TicketType.price.
+  unitPrice  Decimal @db.Decimal(10, 2)
+  totalPrice Decimal @db.Decimal(10, 2)
+
+  // Denormalized copy of the parent Booking's status, kept in sync in the
+  // same transaction whenever the booking's status changes. Exists solely
+  // so a partial unique index (added via raw SQL in the migration) can
+  // enforce "this seat has at most one PENDING/CONFIRMED booking item" at
+  // the database level — Postgres partial indexes can't reference a joined
+  // table's column, so the status has to live on this row itself.
+  status BookingStatus
+
+  createdAt DateTime @default(now())
+
+  // Cascade: a booking item has no meaning outside its booking (composition).
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  // Restrict: purchase history must never be silently destroyed by
+  // something happening to the ticket type or seat it references.
+  ticketType TicketType @relation(fields: [ticketTypeId], references: [id], onDelete: Restrict)
+  seat       Seat?      @relation(fields: [seatId], references: [id], onDelete: Restrict)
+
+  @@index([bookingId])
+  @@index([ticketTypeId, status])
+  @@index([seatId])
+  @@map("booking_items")
 }
