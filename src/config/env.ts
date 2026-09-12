@@ -11,6 +11,18 @@ const envSchema = z.object({
   GOOGLE_CLIENT_ID: z.string().optional(),
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   GOOGLE_CALLBACK_URL: z.string().optional(),
+
+  // Stripe (test mode). Both optional: when either is unset, the app falls
+  // back to an in-process fake payment provider (see
+  // src/providers/payment-provider.factory.ts) so the server, and the full
+  // test suite, run correctly with zero real Stripe credentials.
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+
+  // Redis connection for the BullMQ booking-expiry worker (src/worker.ts).
+  // Only that separate worker process actually needs Redis reachable — the
+  // API server and the full test suite never connect to it.
+  REDIS_URL: z.string().default("redis://localhost:6379"),
 });
 
 function loadEnv() {

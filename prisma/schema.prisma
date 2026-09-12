@@ -37,6 +37,13 @@ enum BookingStatus {
   EXPIRED
 }
 
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
 model User {
   id           String   @id @default(uuid()) @db.Uuid
   name         String
@@ -325,13 +332,61 @@ model Booking {
   user  User  @relation(fields: [userId], references: [id], onDelete: Restrict)
   event Event @relation(fields: [eventId], references: [id], onDelete: Restrict)
 
-  items BookingItem[]
+  items    BookingItem[]
+  payments Payment[]
 
   @@unique([userId, idempotencyKey])
   @@index([userId])
   @@index([eventId])
   @@index([status, expiresAt])
   @@map("bookings")
+}
+
+model Payment {
+  id        String @id @default(uuid()) @db.Uuid
+  bookingId String @db.Uuid
+
+  // A plain String, not an enum — same reasoning as TicketType.currency:
+  // adding Razorpay or another provider later needs zero schema/migration
+  // changes. "stripe" for now.
+  provider String
+
+  // The provider's own id for this payment (Stripe PaymentIntent id,
+  // "pi_..."). Always known before we persist the row — we call the
+  // provider first, then save — so this is required, not nullable.
+  providerPaymentId String
+
+  // Snapshotted from Booking.total/currency at the moment this payment was
+  // created — never recalculated from a possibly-changed booking later.
+  // The webhook handler verifies an incoming event's amount/currency
+  // against THIS, not against the (mutable) Booking, closing off any
+  // possibility of a stale or tampered amount being accepted.
+  amount   Decimal @db.Decimal(10, 2)
+  currency String
+
+  status PaymentStatus @default(PENDING)
+
+  // The id of the last provider webhook event that changed this payment's
+  // status. Recorded for audit/debugging traceability — NOT the primary
+  // idempotency mechanism (that's the guarded conditional UPDATE described
+  // in the Phase 6 report: `WHERE id = ? AND status = 'PENDING'`, which
+  // Postgres's own row-level locking makes safe under concurrent/duplicate
+  // webhook delivery on its own). Still kept unique as a DB-level sanity
+  // check that two different payments never claim the same event.
+  providerEventId String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Restrict: a payment is financial history and must never be silently
+  // destroyed by anything happening to its booking.
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  // A given provider's payment id must never be claimed by two different
+  // Payment rows.
+  @@unique([provider, providerPaymentId])
+  @@index([bookingId, status])
+  @@map("payments")
 }
 
 model BookingItem {

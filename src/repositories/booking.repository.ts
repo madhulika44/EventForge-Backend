@@ -185,25 +185,59 @@ export function createBookingWithItems(data: CreateBookingData, tx: Prisma.Trans
   });
 }
 
+export interface TransitionResult {
+  /** false means someone else already moved this booking off `fromStatuses`
+   * before this call's UPDATE could — a safe, expected outcome under
+   * concurrency (e.g. the payment-vs-expiry race), never an error. */
+  transitioned: boolean;
+  booking: BookingWithItems;
+}
+
 /**
- * Transitions a booking and all its items to the given status together,
- * atomically. Booking.status and BookingItem.status must never drift apart
- * — the partial unique index on BookingItem relies on its own status column
- * being accurate — so this always runs as one transaction rather than two
- * independent writes (a crash between them would otherwise be possible).
+ * Transitions a booking and all its items to `toStatus`, but only if the
+ * booking is currently in one of `fromStatuses` — atomically, and safe
+ * under concurrency with no explicit row lock needed.
+ *
+ * Why this is race-safe: `UPDATE ... WHERE id = ? AND status IN (...)` is a
+ * single statement, and Postgres takes a row-level write lock on the target
+ * row as part of executing it. If two transactions race to transition the
+ * same booking (e.g. a payment webhook confirming it while the expiry
+ * worker is simultaneously trying to expire it), the second one's UPDATE
+ * blocks until the first commits, then re-evaluates its own WHERE clause
+ * against the now-committed row — finds status is no longer in
+ * `fromStatuses`, and affects zero rows. That's exactly the `transitioned:
+ * false` case: a safe no-op, not a partial or corrupted update. This needs
+ * no raw SELECT ... FOR UPDATE query and no extra schema column; it's
+ * Postgres's ordinary UPDATE semantics, applied deliberately.
  */
-async function transitionBookingAndItems(id: string, status: typeof BookingStatus.CANCELLED | typeof BookingStatus.EXPIRED): Promise<BookingWithItems> {
-  return prisma.$transaction(async (tx) => {
-    await tx.booking.update({ where: { id }, data: { status } });
-    await tx.bookingItem.updateMany({ where: { bookingId: id }, data: { status } });
-    return findBookingById(id, tx) as Promise<BookingWithItems>;
+export async function transitionBookingIfInState(
+  id: string,
+  fromStatuses: BookingStatus[],
+  toStatus: BookingStatus,
+  tx: Prisma.TransactionClient,
+): Promise<TransitionResult> {
+  const result = await tx.booking.updateMany({
+    where: { id, status: { in: fromStatuses } },
+    data: { status: toStatus },
   });
+
+  if (result.count > 0) {
+    await tx.bookingItem.updateMany({ where: { bookingId: id }, data: { status: toStatus } });
+  }
+
+  const booking = await findBookingById(id, tx);
+  if (!booking) {
+    throw new Error(`transitionBookingIfInState: booking ${id} not found`);
+  }
+  return { transitioned: result.count > 0, booking };
 }
 
-export function markBookingCancelled(id: string): Promise<BookingWithItems> {
-  return transitionBookingAndItems(id, BookingStatus.CANCELLED);
-}
-
-export function markBookingExpired(id: string): Promise<BookingWithItems> {
-  return transitionBookingAndItems(id, BookingStatus.EXPIRED);
+/** IDs of PENDING bookings whose hold window has already passed —
+ * candidates for the expiry worker (or a lazy check) to transition. */
+export async function findDuePendingBookingIds(now: Date = new Date()): Promise<string[]> {
+  const due = await prisma.booking.findMany({
+    where: { status: BookingStatus.PENDING, expiresAt: { lt: now } },
+    select: { id: true },
+  });
+  return due.map((b) => b.id);
 }

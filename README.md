@@ -59,6 +59,8 @@ Request → Route → Controller → Service → Repository → Prisma → Postg
 | `npm run prisma:generate` | Regenerate the Prisma client after a schema change |
 | `npm run prisma:migrate` | Create/apply a migration in dev |
 | `npm run prisma:studio` | Open Prisma Studio (visual DB browser) |
+| `npm run worker` | Start the booking-expiry background worker (requires Redis — see below) |
+| `npm run start:worker` | Run the compiled worker (`dist/worker.js`) |
 
 ## Authentication
 
@@ -90,6 +92,126 @@ Express app, no server binding required) and are self-isolating: each test uses 
 randomly generated email and cleans up the rows it created afterward, so running
 the suite never disturbs data you created manually. Auth rate limiting is disabled
 under `NODE_ENV=test` (set automatically by `npm test`) so the suite isn't throttled.
+
+## Payments & booking lifecycle (Phase 6)
+
+### Booking state lifecycle
+
+```
+PENDING ──cancel──▶ CANCELLED
+   │                   ▲
+   │ (lazy, or worker) │
+   ▼                   │
+EXPIRED           CONFIRMED ──cancel──▶ CANCELLED
+```
+
+`PENDING` holds its inventory (seats / general-admission quantity) immediately on
+creation (Phase 5). `CONFIRMED` is reached only via a verified payment webhook —
+never by a client simply asserting success. `CANCELLED` and `EXPIRED` are terminal:
+neither can become `CONFIRMED` afterward. Every transition (confirm, cancel, expire)
+uses the same guarded pattern: `UPDATE bookings SET status = X WHERE id = ? AND
+status IN (allowed-from-states)`, checking the affected-row count. Postgres's own
+row-level locking on that `UPDATE` makes two competing transitions (e.g. a payment
+webhook and the expiry worker racing the same booking) safe with no explicit
+`SELECT ... FOR UPDATE` needed: whichever commits first wins, and the loser's `WHERE`
+clause re-evaluates against the now-committed row and safely updates zero rows.
+
+### Payment state lifecycle
+
+```
+PENDING ──succeeded webhook──▶ SUCCEEDED
+   │
+   └──failed webhook──▶ FAILED
+```
+
+A `Payment` snapshots its `amount`/`currency` from `Booking.total`/`Booking.currency`
+at creation time — the webhook handler verifies an incoming event against this
+snapshot, never against the (mutable) booking or anything the webhook payload
+itself claims. `SUCCEEDED` only transitions the parent `Booking` to `CONFIRMED` if
+the booking is still `PENDING`; if it already left `PENDING` (cancelled/expired
+first), the payment is still recorded as `SUCCEEDED` — the money genuinely moved —
+but the booking is not resurrected. Reconciling that case into a refund is
+explicitly out of scope for this phase.
+
+### Payment provider abstraction
+
+```
+PaymentService → PaymentProvider interface → StripePaymentProvider | FakePaymentProvider
+```
+
+`src/providers/payment-provider.ts` defines the interface; `stripe-payment-provider.ts`
+is the real Stripe implementation; `fake-payment-provider.ts` is an in-process test
+double. **Real Stripe credentials are never required** — `src/providers/payment-provider.factory.ts`
+automatically uses the fake provider whenever `NODE_ENV=test`, or whenever
+`STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` aren't set. This means `npm test` and
+even `npm run dev` work out of the box with no Stripe account at all; the fake
+provider is a genuine HMAC-signed test double (tampered signatures really are
+rejected), not a bypass of the webhook logic itself.
+
+### API endpoints
+
+```
+POST /api/bookings/:id/payment        (authenticated; owner only)
+POST /api/payments/webhook/stripe     (Stripe signature-verified, not user-authenticated)
+```
+
+`POST /api/bookings/:id/payment` requires the booking be `PENDING` and not expired,
+derives the amount/currency from the booking itself, and creates (or reuses an
+existing unresolved) payment intent through the provider abstraction. It returns
+only `{ payment: { id, provider, amount, currency, status }, clientSecret }` — no
+secret keys, no internal provider ids beyond what the frontend needs to complete
+payment client-side.
+
+### Stripe test-mode setup (optional — not required for tests or local dev)
+
+1. Create a free Stripe account and switch to **test mode**.
+2. Get your test secret key from https://dashboard.stripe.com/test/apikeys →
+   `STRIPE_SECRET_KEY` in `.env`.
+3. For webhooks locally, install the [Stripe CLI](https://stripe.com/docs/stripe-cli)
+   and run `stripe listen --forward-to localhost:4000/api/payments/webhook/stripe` —
+   it prints a webhook signing secret to put in `STRIPE_WEBHOOK_SECRET`.
+4. Restart the server. Leaving either value blank keeps the fake provider active.
+
+### Webhook raw-body handling
+
+Stripe signature verification needs the exact raw request bytes. `src/app.ts`
+registers `POST /api/payments/webhook/stripe` with its own `express.raw()` parser
+**before** the global `express.json()` middleware, so this one route sees unparsed
+bytes while every other route is unaffected.
+
+### Redis + BullMQ expiry worker
+
+Phase 5 used purely lazy expiry (checked on read/write). Phase 6 adds a proactive
+background sweep via BullMQ, running as a **separate process** from the API server
+(`npm run worker`) — its lifecycle (crashes, restarts, deploys) is intentionally
+decoupled from the HTTP API's.
+
+1. Install Redis locally (e.g. via WSL: `sudo apt install redis-server`, or Windows
+   builds, or Docker: `docker run -p 6379:6379 redis`).
+2. Set `REDIS_URL` in `.env` (defaults to `redis://localhost:6379`).
+3. Run the worker in a separate terminal: `npm run worker`.
+
+The worker doesn't carry a job per booking — a permanent per-booking timer wouldn't
+survive a restart and doesn't scale. Instead one recurring job (every 60s, via
+BullMQ's `upsertJobScheduler` — idempotent across worker restarts) asks the database
+"which `PENDING` bookings are actually overdue right now" and expires them. Every
+expiry goes through the same guarded transition as everything else, so the job is
+safe to run concurrently with itself, retry, or run after a crash: anything already
+resolved by another path (a payment webhook, a cancellation, an earlier sweep) is
+simply skipped.
+
+**Redis is never required for `npm test`** — the expiry logic itself
+(`expireDueBookings()` in `booking.service.ts`) is a plain, directly-callable
+function with zero BullMQ/Redis dependency, and the full test suite calls it
+directly against the real database.
+
+### Environment variables (Phase 6 additions)
+
+| Variable | Required? | Purpose |
+| --- | --- | --- |
+| `STRIPE_SECRET_KEY` | No | Real Stripe test-mode secret key; omit to use the fake provider |
+| `STRIPE_WEBHOOK_SECRET` | No | Real Stripe webhook signing secret; omit to use the fake provider |
+| `REDIS_URL` | No (defaults to `redis://localhost:6379`) | Only read by `npm run worker` |
 
 ## Known trade-offs / accepted risks
 

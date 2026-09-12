@@ -44,12 +44,44 @@ function assertCanAccess(booking: Booking, requester: AuthenticatedUser): void {
 }
 
 /** PENDING + past its hold window is treated as EXPIRED the moment anything
- * looks at it — there is no background worker for this in this phase. */
+ * looks at it — a fallback in case the background worker (Phase 6) hasn't
+ * gotten to it yet, or isn't running. Uses the same guarded transition as
+ * everything else, so this can never race-corrupt a booking the worker or
+ * a payment webhook is transitioning at the same moment. */
 async function lazilyExpireIfDue(booking: BookingWithItems): Promise<BookingWithItems> {
   if (booking.status === BookingStatus.PENDING && booking.expiresAt && booking.expiresAt < new Date()) {
-    return bookingRepository.markBookingExpired(booking.id);
+    const { booking: updated } = await prisma.$transaction((tx) =>
+      bookingRepository.transitionBookingIfInState(booking.id, [BookingStatus.PENDING], BookingStatus.EXPIRED, tx),
+    );
+    return updated;
   }
   return booking;
+}
+
+/**
+ * Expires every PENDING booking whose hold window has passed. Called by the
+ * BullMQ worker on a schedule (src/workers/booking-expiry.worker.ts), and
+ * safe to call repeatedly or concurrently with itself: each booking is its
+ * own transaction, guarded by transitionBookingIfInState, so re-running
+ * this (worker restart, retried job, overlapping runs) never double-expires
+ * or corrupts anything — a booking already moved off PENDING by a previous
+ * run, a payment webhook, or a lazy check just yields `transitioned: false`
+ * and is skipped.
+ */
+export async function expireDueBookings(): Promise<{ expiredCount: number; checkedCount: number }> {
+  const dueIds = await bookingRepository.findDuePendingBookingIds();
+  let expiredCount = 0;
+
+  for (const id of dueIds) {
+    const { transitioned } = await prisma.$transaction((tx) =>
+      bookingRepository.transitionBookingIfInState(id, [BookingStatus.PENDING], BookingStatus.EXPIRED, tx),
+    );
+    if (transitioned) {
+      expiredCount++;
+    }
+  }
+
+  return { expiredCount, checkedCount: dueIds.length };
 }
 
 interface ResolvedItems {
@@ -235,5 +267,16 @@ export async function cancelBooking(id: string, requester: AuthenticatedUser): P
     throw new AppError(400, "BOOKING_NOT_CANCELLABLE", "This booking can no longer be cancelled");
   }
 
-  return bookingRepository.markBookingCancelled(id);
+  // Guarded, not a blind update: if the expiry worker (or a payment
+  // webhook) races this and wins first, this correctly no-ops instead of
+  // overwriting whatever terminal state it just landed in.
+  const { booking: updated } = await prisma.$transaction((tx) =>
+    bookingRepository.transitionBookingIfInState(
+      id,
+      [BookingStatus.PENDING, BookingStatus.CONFIRMED],
+      BookingStatus.CANCELLED,
+      tx,
+    ),
+  );
+  return updated;
 }
