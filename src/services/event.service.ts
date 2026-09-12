@@ -1,9 +1,17 @@
 import type { Event } from "@prisma/client";
 import { EventStatus, Role } from "@prisma/client";
 import * as eventRepository from "../repositories/event.repository";
+import { findVenueById } from "../repositories/venue.repository";
 import { AppError } from "../utils/app-error";
 import type { AuthenticatedUser } from "../types/auth.types";
 import type { CreateEventInput, UpdateEventInput } from "../schemas/event.schema";
+
+async function assertVenueExists(venueId: string): Promise<void> {
+  const venue = await findVenueById(venueId);
+  if (!venue) {
+    throw new AppError(400, "INVALID_VENUE_ID", "The specified venue does not exist");
+  }
+}
 
 export interface PaginatedEvents {
   data: Event[];
@@ -33,6 +41,9 @@ async function findEventOr404(id: string): Promise<Event> {
 }
 
 export async function createEvent(organizerId: string, input: CreateEventInput): Promise<Event> {
+  if (input.venueId) {
+    await assertVenueExists(input.venueId);
+  }
   return eventRepository.createEvent({ organizerId, ...input });
 }
 
@@ -76,6 +87,10 @@ export async function updateEvent(
 ): Promise<Event> {
   const event = await findEventOr404(id);
   assertCanManage(event, requester);
+
+  if (input.venueId) {
+    await assertVenueExists(input.venueId);
+  }
 
   const effectiveStart = input.startDateTime ?? event.startDateTime;
   const effectiveEnd = input.endDateTime ?? event.endDateTime;

@@ -36,6 +36,7 @@ model User {
   oauthAccounts OAuthAccount[]
   refreshTokens RefreshToken[]
   events        Event[]
+  venues        Venue[]
 
   @@map("users")
 }
@@ -56,12 +57,12 @@ model OAuthAccount {
 }
 
 model RefreshToken {
-  id         String    @id @default(uuid()) @db.Uuid
-  userId     String    @db.Uuid
-  tokenHash  String    @unique
-  expiresAt  DateTime
-  revokedAt  DateTime?
-  createdAt  DateTime  @default(now())
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -74,9 +75,6 @@ model Event {
   organizerId   String      @db.Uuid
   title         String
   description   String?
-  // No Venue model yet (comes in a later phase). Left as a plain nullable
-  // column with no foreign key for now rather than inventing a placeholder
-  // Venue table; a migration will add the real relation when Venue lands.
   venueId       String?     @db.Uuid
   startDateTime DateTime
   endDateTime   DateTime
@@ -90,7 +88,92 @@ model Event {
   // currently theoretical, but it's the safer default to start with.
   organizer User @relation(fields: [organizerId], references: [id], onDelete: Restrict)
 
+  // Same reasoning as organizer above: a Venue is a separate aggregate that
+  // an Event merely references, so its deletion must never silently orphan
+  // or null-out an event. The exposed DELETE /api/venues/:id is a soft
+  // archive (see Venue.archivedAt) and never physically removes the row;
+  // Restrict is defense-in-depth for any future/direct hard-delete path.
+  venue Venue? @relation(fields: [venueId], references: [id], onDelete: Restrict)
+
   @@index([organizerId])
   @@index([status, startDateTime])
+  @@index([venueId])
   @@map("events")
+}
+
+model Venue {
+  id           String    @id @default(uuid()) @db.Uuid
+  ownerId      String    @db.Uuid
+  name         String
+  description  String?
+  addressLine1 String
+  addressLine2 String?
+  city         String
+  state        String
+  country      String
+  postalCode   String
+  capacity     Int
+  // Soft-delete marker: DELETE /api/venues/:id sets this instead of removing
+  // the row, mirroring how Event's own DELETE is a soft CANCELLED transition
+  // rather than a physical delete. An archived venue is hidden from the
+  // public list/detail but stays fully intact for any event referencing it,
+  // and remains visible to its owner/ADMIN.
+  archivedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // Restrict: see the matching comment on Event.organizer. Deleting a user
+  // should never silently destroy the venues they created.
+  owner    User           @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  sections VenueSection[]
+  events   Event[]
+
+  @@index([ownerId])
+  @@index([archivedAt, createdAt])
+  @@map("venues")
+}
+
+model VenueSection {
+  id          String   @id @default(uuid()) @db.Uuid
+  venueId     String   @db.Uuid
+  name        String
+  description String?
+  capacity    Int
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Cascade here (unlike the Restrict relations above) because a section has
+  // no independent existence outside its venue — it's composition, not a
+  // cross-aggregate reference. Deleting a venue's sections is only ever
+  // reachable through our own hard-delete-free API today, but the schema
+  // should still reflect that sections/seats belong to their venue.
+  venue Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  seats Seat[]
+
+  // Prevents two sections in the same venue from accidentally sharing a name
+  // (e.g. two "VIP" sections created by mistake).
+  @@unique([venueId, name])
+  @@index([venueId])
+  @@map("venue_sections")
+}
+
+model Seat {
+  id             String   @id @default(uuid()) @db.Uuid
+  venueSectionId String   @db.Uuid
+  rowLabel       String
+  seatNumber     Int
+  // Display label (e.g. "A1", or a custom name for an accessible seat that
+  // doesn't fit the row/number pattern). Always populated: the service
+  // defaults it to `${rowLabel}${seatNumber}` when a client doesn't supply one.
+  label          String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  section VenueSection @relation(fields: [venueSectionId], references: [id], onDelete: Cascade)
+
+  // A seat should not be duplicated within the same section.
+  @@unique([venueSectionId, rowLabel, seatNumber])
+  @@index([venueSectionId])
+  @@map("seats")
 }

@@ -6,12 +6,13 @@ export interface CreateEventData {
   organizerId: string;
   title: string;
   description?: string | undefined;
+  venueId?: string | undefined;
   startDateTime: Date;
   endDateTime: Date;
 }
 
 export function createEvent(data: CreateEventData): Promise<Event> {
-  const { organizerId, title, startDateTime, endDateTime, description } = data;
+  const { organizerId, title, startDateTime, endDateTime, description, venueId } = data;
   return prisma.event.create({
     data: {
       organizerId,
@@ -21,6 +22,7 @@ export function createEvent(data: CreateEventData): Promise<Event> {
       // Prisma's generated input type wants the key omitted entirely when
       // there's no value, not set to `undefined` (exactOptionalPropertyTypes).
       ...(description !== undefined ? { description } : {}),
+      ...(venueId !== undefined ? { venueId } : {}),
     },
   });
 }
@@ -54,18 +56,20 @@ export async function findPublishedEvents({
 export interface UpdateEventData {
   title?: string | undefined;
   description?: string | null | undefined;
+  venueId?: string | null | undefined;
   startDateTime?: Date | undefined;
   endDateTime?: Date | undefined;
   status?: EventStatus | undefined;
 }
 
 export function updateEvent(id: string, data: UpdateEventData): Promise<Event> {
-  const { title, description, startDateTime, endDateTime, status } = data;
+  const { title, description, venueId, startDateTime, endDateTime, status } = data;
   return prisma.event.update({
     where: { id },
     data: {
       ...(title !== undefined ? { title } : {}),
       ...(description !== undefined ? { description } : {}),
+      ...(venueId !== undefined ? { venueId } : {}),
       ...(startDateTime !== undefined ? { startDateTime } : {}),
       ...(endDateTime !== undefined ? { endDateTime } : {}),
       ...(status !== undefined ? { status } : {}),

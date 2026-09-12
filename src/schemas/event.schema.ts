@@ -15,10 +15,13 @@ const isoDateTime = (fieldName: string) =>
     .datetime({ offset: true, message: `${fieldName} must be a valid ISO 8601 date-time` })
     .transform((value) => new Date(value));
 
+const venueId = z.string().uuid("venueId must be a valid UUID");
+
 export const createEventSchema = z
   .object({
     title,
     description: description.optional(),
+    venueId: venueId.optional(),
     startDateTime: isoDateTime("startDateTime"),
     endDateTime: isoDateTime("endDateTime"),
   })
@@ -31,6 +34,7 @@ export const updateEventSchema = z
   .object({
     title: title.optional(),
     description: description.nullable().optional(),
+    venueId: venueId.nullable().optional(),
     startDateTime: isoDateTime("startDateTime").optional(),
     endDateTime: isoDateTime("endDateTime").optional(),
     status: z.nativeEnum(EventStatus).optional(),

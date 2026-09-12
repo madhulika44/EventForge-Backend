@@ -43,6 +43,14 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
+  if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2003") {
+    res.status(409).json({
+      success: false,
+      error: { code: "REFERENCED_RESOURCE", message: "Cannot perform this action because other records depend on it" },
+    } satisfies ApiErrorBody);
+    return;
+  }
+
   logger.error({ err, path: req.path, method: req.method }, "Unhandled error");
 
   res.status(500).json({
