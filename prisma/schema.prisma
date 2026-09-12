@@ -16,6 +16,13 @@ enum OAuthProvider {
   GOOGLE
 }
 
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+  COMPLETED
+}
+
 model User {
   id           String   @id @default(uuid()) @db.Uuid
   name         String
@@ -28,6 +35,7 @@ model User {
 
   oauthAccounts OAuthAccount[]
   refreshTokens RefreshToken[]
+  events        Event[]
 
   @@map("users")
 }
@@ -59,4 +67,30 @@ model RefreshToken {
 
   @@index([userId])
   @@map("refresh_tokens")
+}
+
+model Event {
+  id            String      @id @default(uuid()) @db.Uuid
+  organizerId   String      @db.Uuid
+  title         String
+  description   String?
+  // No Venue model yet (comes in a later phase). Left as a plain nullable
+  // column with no foreign key for now rather than inventing a placeholder
+  // Venue table; a migration will add the real relation when Venue lands.
+  venueId       String?     @db.Uuid
+  startDateTime DateTime
+  endDateTime   DateTime
+  status        EventStatus @default(DRAFT)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  // Restrict (not Cascade): deleting an organizer's account should never
+  // silently wipe out event records — those are business-critical once
+  // bookings exist. User deletion isn't implemented yet, so this is
+  // currently theoretical, but it's the safer default to start with.
+  organizer User @relation(fields: [organizerId], references: [id], onDelete: Restrict)
+
+  @@index([organizerId])
+  @@index([status, startDateTime])
+  @@map("events")
 }

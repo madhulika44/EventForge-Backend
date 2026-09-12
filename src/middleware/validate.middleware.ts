@@ -21,3 +21,23 @@ export function validateBody(schema: ZodSchema) {
     next();
   };
 }
+
+/**
+ * Query-string validator. Stores the parsed result on res.locals.query
+ * rather than reassigning req.query, since Express 5 exposes req.query
+ * as a getter-only property.
+ */
+export function validateQuery(schema: ZodSchema) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const result = schema.safeParse(req.query);
+
+    if (!result.success) {
+      const message = result.error.issues[0]?.message ?? "Invalid query parameters";
+      next(new AppError(400, "VALIDATION_ERROR", message));
+      return;
+    }
+
+    res.locals.query = result.data;
+    next();
+  };
+}

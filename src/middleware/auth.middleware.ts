@@ -20,3 +20,29 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction): v
     next(new AppError(401, "UNAUTHORIZED", "Invalid or expired access token"));
   }
 }
+
+/**
+ * Attaches req.user when a valid access token is present, but never rejects
+ * the request otherwise — for routes that are public but behave differently
+ * for an authenticated caller (e.g. an organizer previewing their own
+ * unpublished event).
+ */
+export function optionalAuth(req: Request, _res: Response, next: NextFunction): void {
+  const header = req.headers.authorization;
+
+  if (!header?.startsWith("Bearer ")) {
+    next();
+    return;
+  }
+
+  const token = header.slice("Bearer ".length);
+
+  try {
+    const payload = verifyAccessToken(token);
+    req.user = { id: payload.sub, role: payload.role };
+  } catch {
+    // Invalid/expired token on a public route: proceed unauthenticated.
+  }
+
+  next();
+}
