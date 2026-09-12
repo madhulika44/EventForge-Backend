@@ -51,6 +51,23 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     return;
   }
 
+  // A DB-level RESTRICT violation caught by Postgres itself (rather than
+  // pre-checked by Prisma's own query engine) doesn't get mapped to a known
+  // P-code — it surfaces as PrismaClientUnknownRequestError with the raw
+  // Postgres error text and no structured `.code`. Detected here by message
+  // content so it still gets the same clean 409 instead of leaking the raw
+  // database error (found via a real FK-restrict test in Phase 4).
+  if (
+    err instanceof Prisma.PrismaClientUnknownRequestError &&
+    /foreign key constraint/i.test(err.message)
+  ) {
+    res.status(409).json({
+      success: false,
+      error: { code: "REFERENCED_RESOURCE", message: "Cannot perform this action because other records depend on it" },
+    } satisfies ApiErrorBody);
+    return;
+  }
+
   logger.error({ err, path: req.path, method: req.method }, "Unhandled error");
 
   res.status(500).json({

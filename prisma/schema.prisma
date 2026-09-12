@@ -23,6 +23,13 @@ enum EventStatus {
   COMPLETED
 }
 
+enum TicketStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  CLOSED
+}
+
 model User {
   id           String   @id @default(uuid()) @db.Uuid
   name         String
@@ -95,6 +102,11 @@ model Event {
   // Restrict is defense-in-depth for any future/direct hard-delete path.
   venue Venue? @relation(fields: [venueId], references: [id], onDelete: Restrict)
 
+  // Composition, not reference — a ticket type has no meaning outside its
+  // event (same reasoning as VenueSection -> Venue being Cascade rather
+  // than Restrict).
+  ticketTypes TicketType[]
+
   @@index([organizerId])
   @@index([status, startDateTime])
   @@index([venueId])
@@ -151,11 +163,69 @@ model VenueSection {
   venue Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade)
   seats Seat[]
 
+  // Restrict, not Cascade: unlike Seat (pure composition, no meaning outside
+  // its section), a TicketType referencing this section is a real business
+  // record that must not be silently orphaned or deleted just because the
+  // venue's seating layout changes. This also means the existing hard-delete
+  // section endpoint (built before TicketType existed) will now correctly
+  // fail if a ticket type is linked to it — handled by the P2003 mapping
+  // already added to error.middleware.ts in Phase 3.
+  ticketTypes TicketType[]
+
   // Prevents two sections in the same venue from accidentally sharing a name
   // (e.g. two "VIP" sections created by mistake).
   @@unique([venueId, name])
   @@index([venueId])
   @@map("venue_sections")
+}
+
+model TicketType {
+  id          String  @id @default(uuid()) @db.Uuid
+  eventId     String  @db.Uuid
+  name        String
+  description String?
+
+  // Exact decimal money storage (NUMERIC), not a float — see the Phase 4
+  // report for why. Precision 10, scale 2: up to 99,999,999.99.
+  price    Decimal @db.Decimal(10, 2)
+  // ISO 4217 code (e.g. "INR", "USD"), validated at the Zod layer, not
+  // hardcoded here — a new currency needs zero schema/migration changes.
+  currency String
+
+  // Total tickets available for sale. Deliberately just one number: no
+  // soldQuantity/availableQuantity columns. Those would be counters the
+  // future Booking phase would have to keep in sync by hand, which is
+  // exactly the kind of redundant, driftable state this phase was told to
+  // avoid — "sold" and "available" are derived from Booking rows later,
+  // never stored here.
+  quantity Int
+
+  // Nullable: null = general admission (no seat-level assignment). When
+  // set, the service layer enforces that the section belongs to this
+  // event's venue and that quantity does not exceed the section's capacity
+  // (a normal FK can't express either rule — see the Phase 4 report).
+  venueSectionId String? @db.Uuid
+
+  saleStartAt DateTime?
+  saleEndAt   DateTime?
+
+  status    TicketStatus @default(DRAFT)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  // Cascade: a ticket type has no meaning outside its event, same
+  // composition reasoning as VenueSection -> Venue.
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  // Restrict: see the comment on VenueSection.ticketTypes above.
+  venueSection VenueSection? @relation(fields: [venueSectionId], references: [id], onDelete: Restrict)
+
+  // Prevents two same-named tiers on one event (e.g. two "VIP"s by mistake),
+  // mirroring the VenueSection name-uniqueness precedent.
+  @@unique([eventId, name])
+  @@index([eventId, status])
+  @@index([venueSectionId])
+  @@map("ticket_types")
 }
 
 model Seat {
