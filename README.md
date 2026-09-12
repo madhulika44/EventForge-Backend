@@ -203,7 +203,83 @@ simply skipped.
 **Redis is never required for `npm test`** — the expiry logic itself
 (`expireDueBookings()` in `booking.service.ts`) is a plain, directly-callable
 function with zero BullMQ/Redis dependency, and the full test suite calls it
-directly against the real database.
+directly against the real database. As of Phase 7, `npm run worker` also starts the
+refund-processing worker (below) in the same process — both are lightweight enough
+that there's no reason to run them separately yet.
+
+## Refunds & organizer booking management (Phase 7)
+
+### Refund state lifecycle
+
+```
+PENDING ──provider/webhook confirms──▶ SUCCEEDED
+   │
+   └──provider call fails──▶ FAILED ──(admin retry creates a NEW attempt)──▶ PENDING → ...
+```
+
+A `Refund` is its own model (not fields on `Payment`), mirroring why `Payment` is its
+own model rather than fields on `Booking`: a payment can have multiple attempts, and
+so can a refund. Full-refund-only in V1 — `Refund.amount` always equals the
+payment's amount. `Booking`/`BookingItem`/`Payment` state machines are **unchanged**
+by refunds: a refunded booking stays `CANCELLED`, and a refunded payment stays
+`SUCCEEDED` (the charge really did succeed; the refund is a separate, later event —
+same as Stripe's own model). Nothing about "was this refunded" lives on `Booking` —
+it's derived by joining `Booking → Payment → Refund`.
+
+A `Refund` row is persisted as `PENDING` — with its idempotency key already fixed —
+**before** the provider is ever called, unlike `Payment.providerPaymentId` which is
+only known after a synchronous call inside an HTTP request. Refund processing runs
+in a background worker with no client waiting, so persist-then-call is what keeps a
+worker crash between "the provider confirmed the refund" and "we recorded that fact"
+from leaving real money moved with zero local record — the refund webhook is a
+second, independent path to reach the correct state either way.
+
+**Duplicate-refund protection is three layers deep**, each independently sufficient:
+1. A Postgres **partial unique index** — `refunds_active_payment_unique` — allows at
+   most one `PENDING` or `SUCCEEDED` refund per payment (a `FAILED` one doesn't
+   count, so a retry can create a fresh row). The hard backstop, DB-enforced.
+2. The same **guarded conditional `UPDATE`** pattern used everywhere else in this
+   project (`transitionRefundIfInState`) for the PENDING→SUCCEEDED/FAILED transition.
+3. BullMQ's own **job-id deduplication** — a refund job is enqueued with the refund's
+   own id as its BullMQ job id, so enqueuing "the same" refund twice is a queue-level
+   no-op too.
+
+A refund is triggered two ways, both funneled through the same
+`ensureRefundForPayment` function so "never create a second active refund" is
+enforced in exactly one place: automatically when a `CONFIRMED` (paid) booking is
+cancelled (`booking.service.cancelBooking` → `refund.service.triggerRefundForCancelledBooking`
+— cancelling a `PENDING`, never-paid booking finds no `SUCCEEDED` payment and
+triggers nothing), or manually via `POST /api/bookings/:id/refund` (ADMIN-only,
+idempotent, primarily for retrying after a `FAILED` attempt). Cancellation itself
+stays synchronous and fast; the refund's actual provider call happens asynchronously
+via the same BullMQ infrastructure as booking expiry.
+
+A genuine provider failure (Stripe declines the refund, etc.) is recorded as
+terminal `FAILED` immediately — it is **not** retried automatically by BullMQ, since
+blindly retrying a provider-rejected refund isn't safe by default; that's what the
+admin retry endpoint is for. BullMQ's own retry/backoff instead covers *our own*
+infrastructure hiccups (a transient DB/Redis blip while recording the outcome).
+
+### Organizer booking APIs
+
+```
+GET /api/events/:eventId/bookings              (organizer of that event, or ADMIN)
+GET /api/events/:eventId/bookings/:bookingId   (organizer of that event, or ADMIN)
+```
+
+Event-scoped (not a global booking-browsing endpoint), mirroring exactly how ticket
+types are already nested under events — an ADMIN can still reach any event's
+bookings this way without a separate global surface. Paginated, with an optional
+`?status=` filter (`PENDING` | `CONFIRMED` | `CANCELLED` | `EXPIRED`).
+
+Responses are a dedicated, privacy-safe DTO (`AttendeeBookingView`), never the raw
+`Booking`/`BookingItem`/`User` models — the same idea as `toPublicUser` in the auth
+domain. An organizer sees the attendee's name/email, the booking's status/total/
+reference, and each line item shaped as either `{ type: "RESERVED", ticketTypeName,
+seatLabel }` or `{ type: "GENERAL_ADMISSION", ticketTypeName, quantity }`. It never
+includes `passwordHash`, `role`, other bookings by the same attendee, or any
+payment/refund internals. A booking id that belongs to a different event returns
+`404`, never leaking another event's data through a mismatched `eventId`.
 
 ### Environment variables (Phase 6 additions)
 

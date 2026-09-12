@@ -3,6 +3,7 @@ import { BookingStatus, PaymentStatus } from "@prisma/client";
 import * as paymentRepository from "../repositories/payment.repository";
 import * as bookingRepository from "../repositories/booking.repository";
 import { getOwnBooking } from "./booking.service";
+import { handleRefundWebhookEvent } from "./refund.service";
 import { getPaymentProvider } from "../providers/payment-provider.factory";
 import { prisma } from "../config/database";
 import { logger } from "../config/logger";
@@ -68,9 +69,24 @@ export async function createPaymentForBooking(bookingId: string, requester: Auth
  */
 export async function handleStripeWebhook(rawBody: Buffer, signature: string): Promise<void> {
   const provider = getPaymentProvider();
-  // Throws on an invalid/tampered signature — the controller lets that
-  // reject the request with 400 rather than reaching this function's body.
-  const event = provider.verifyWebhookSignature(rawBody, signature);
+
+  // Wrapped specifically so the controller can tell "signature invalid"
+  // (400 — Stripe will not and should not retry a request that can never
+  // succeed) apart from any OTHER error below (processing failure due to a
+  // transient DB/infra issue), which must surface as a 500 so Stripe's own
+  // retry policy kicks in — that retry is part of this design's
+  // reconciliation story, not just a nicety.
+  let event;
+  try {
+    event = provider.verifyWebhookSignature(rawBody, signature);
+  } catch {
+    throw new AppError(400, "INVALID_SIGNATURE", "Invalid webhook signature");
+  }
+
+  if (event.providerRefundId) {
+    await handleRefundWebhookEvent(event);
+    return;
+  }
 
   if (!RELEVANT_EVENT_TYPES.has(event.type)) {
     logger.info({ eventId: event.id, eventType: event.type }, "Ignoring irrelevant Stripe webhook event");

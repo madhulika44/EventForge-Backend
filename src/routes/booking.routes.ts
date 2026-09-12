@@ -6,6 +6,7 @@ import {
   listBookingsHandler,
 } from "../controllers/booking.controller";
 import { createPaymentHandler } from "../controllers/payment.controller";
+import { retryRefundHandler } from "../controllers/refund.controller";
 import { requireAuth } from "../middleware/auth.middleware";
 import { validateBody, validateQuery } from "../middleware/validate.middleware";
 import { createBookingSchema, listBookingsQuerySchema } from "../schemas/booking.schema";
@@ -17,5 +18,9 @@ router.get("/", requireAuth, validateQuery(listBookingsQuerySchema), listBooking
 router.get("/:id", requireAuth, getBookingHandler);
 router.post("/:id/cancel", requireAuth, cancelBookingHandler);
 router.post("/:id/payment", requireAuth, createPaymentHandler);
+// ADMIN-only check happens in refund.service.ts (retryRefundForBooking),
+// consistent with how every other authorization check in this codebase
+// lives in the service layer rather than as route-level role middleware.
+router.post("/:id/refund", requireAuth, retryRefundHandler);
 
 export default router;

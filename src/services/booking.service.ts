@@ -5,7 +5,9 @@ import type { BookingWithItems } from "../repositories/booking.repository";
 import { findEventById } from "../repositories/event.repository";
 import { findTicketTypeById } from "../repositories/ticket-type.repository";
 import { findSeatById } from "../repositories/seat.repository";
+import { triggerRefundForCancelledBooking } from "./refund.service";
 import { prisma } from "../config/database";
+import { logger } from "../config/logger";
 import { AppError } from "../utils/app-error";
 import type { AuthenticatedUser } from "../types/auth.types";
 import type { CreateBookingInput } from "../schemas/booking.schema";
@@ -270,7 +272,7 @@ export async function cancelBooking(id: string, requester: AuthenticatedUser): P
   // Guarded, not a blind update: if the expiry worker (or a payment
   // webhook) races this and wins first, this correctly no-ops instead of
   // overwriting whatever terminal state it just landed in.
-  const { booking: updated } = await prisma.$transaction((tx) =>
+  const { booking: updated, transitioned } = await prisma.$transaction((tx) =>
     bookingRepository.transitionBookingIfInState(
       id,
       [BookingStatus.PENDING, BookingStatus.CONFIRMED],
@@ -278,5 +280,25 @@ export async function cancelBooking(id: string, requester: AuthenticatedUser): P
       tx,
     ),
   );
+
+  if (transitioned) {
+    // Deliberately NOT gated on the pre-transition booking.status read
+    // above: that read can be stale if a payment webhook concurrently
+    // confirmed the booking between it and the guarded transition, which
+    // would silently skip a refund for money that genuinely moved.
+    // triggerRefundForCancelledBooking re-derives refund-worthiness from a
+    // fresh query (does this booking have a SUCCEEDED payment right now?),
+    // which is race-free and a clean no-op for a booking that was truly
+    // never paid. This stays fire-and-forget from the HTTP response's
+    // perspective — refund processing is asynchronous via BullMQ, so
+    // cancellation itself stays fast. A failure here (e.g. Redis briefly
+    // unreachable) is logged, not thrown: the booking is already correctly
+    // CANCELLED regardless, and the admin retry endpoint is the fallback
+    // if the refund was never even enqueued.
+    await triggerRefundForCancelledBooking(id).catch((err) => {
+      logger.error({ bookingId: id, err }, "Failed to enqueue refund after booking cancellation");
+    });
+  }
+
   return updated;
 }

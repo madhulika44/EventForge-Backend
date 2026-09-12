@@ -61,6 +61,53 @@ export async function findUserBookings({
   return { bookings, total };
 }
 
+// Shape needed for the organizer-facing attendee projection: the attendee's
+// name/email (nothing else from User) plus each item's ticket type name and
+// seat label. event-booking.service.ts turns this into the privacy-safe
+// AttendeeBookingView DTO — this raw shape is never returned to a client.
+const attendeeDetailsInclude = {
+  user: { select: { name: true, email: true } },
+  items: {
+    include: {
+      ticketType: { select: { name: true } },
+      seat: { select: { label: true } },
+    },
+  },
+} satisfies Prisma.BookingInclude;
+
+export type BookingWithAttendeeDetails = Prisma.BookingGetPayload<{ include: typeof attendeeDetailsInclude }>;
+
+export interface FindBookingsByEventParams {
+  eventId: string;
+  skip: number;
+  take: number;
+  status?: BookingStatus | undefined;
+}
+
+export async function findBookingsByEvent({
+  eventId,
+  skip,
+  take,
+  status,
+}: FindBookingsByEventParams): Promise<{ bookings: BookingWithAttendeeDetails[]; total: number }> {
+  const where = { eventId, ...(status !== undefined ? { status } : {}) };
+  const [bookings, total] = await Promise.all([
+    prisma.booking.findMany({
+      where,
+      include: attendeeDetailsInclude,
+      orderBy: { createdAt: "desc" },
+      skip,
+      take,
+    }),
+    prisma.booking.count({ where }),
+  ]);
+  return { bookings, total };
+}
+
+export function findBookingWithAttendeeDetailsById(id: string): Promise<BookingWithAttendeeDetails | null> {
+  return prisma.booking.findUnique({ where: { id }, include: attendeeDetailsInclude });
+}
+
 /** Locks the ticket type row for the duration of the transaction (so
  * concurrent bookings against it serialize on this lock) and returns its
  * quantity as read under that lock — the freshest possible value, closing

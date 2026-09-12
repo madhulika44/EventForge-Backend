@@ -15,6 +15,16 @@ export function findPendingPaymentForBooking(bookingId: string, client: DbClient
   });
 }
 
+/** The payment that actually succeeded for a booking, if any — a booking
+ * may have multiple Payment rows (failed attempts followed by a successful
+ * one), so this is what refund logic looks up rather than "the" payment. */
+export function findSucceededPaymentForBooking(bookingId: string, client: DbClient = prisma): Promise<Payment | null> {
+  return client.payment.findFirst({
+    where: { bookingId, status: PaymentStatus.SUCCEEDED },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
 export function findPaymentByProviderPaymentId(
   provider: string,
   providerPaymentId: string,

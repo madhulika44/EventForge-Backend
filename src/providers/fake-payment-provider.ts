@@ -1,5 +1,12 @@
 import { randomUUID, createHmac } from "crypto";
-import type { CreatePaymentIntentParams, PaymentIntentResult, PaymentProvider, ProviderWebhookEvent } from "./payment-provider";
+import type {
+  CreatePaymentIntentParams,
+  CreateRefundParams,
+  PaymentIntentResult,
+  PaymentProvider,
+  ProviderWebhookEvent,
+  RefundResult,
+} from "./payment-provider";
 
 /**
  * In-process test double used whenever real Stripe credentials aren't
@@ -21,6 +28,16 @@ export function signFakeWebhookPayload(rawBody: Buffer): string {
   return createHmac("sha256", FAKE_WEBHOOK_SECRET).update(rawBody).digest("hex");
 }
 
+// Test-controllable failure injection for createRefund, mirroring how real
+// payment sandboxes use magic values to trigger specific outcomes. Set by a
+// test right before the call it wants to fail; consumed (reset) on use so
+// it never leaks into unrelated tests.
+let forceNextRefundFailure = false;
+
+export function forceNextFakeRefundFailure(): void {
+  forceNextRefundFailure = true;
+}
+
 export function createFakePaymentProvider(): PaymentProvider {
   return {
     name: "fake",
@@ -31,6 +48,18 @@ export function createFakePaymentProvider(): PaymentProvider {
 
     async retrievePaymentIntent(providerPaymentId: string): Promise<PaymentIntentResult> {
       return { providerPaymentId, clientSecret: `fake_secret_${randomUUID()}` };
+    },
+
+    async createRefund(_params: CreateRefundParams): Promise<RefundResult> {
+      if (forceNextRefundFailure) {
+        forceNextRefundFailure = false;
+        throw new Error("Simulated payment provider failure (forceNextFakeRefundFailure)");
+      }
+      return { providerRefundId: `fake_re_${randomUUID()}`, status: "succeeded" };
+    },
+
+    async retrieveRefund(providerRefundId: string): Promise<RefundResult> {
+      return { providerRefundId, status: "succeeded" };
     },
 
     verifyWebhookSignature(rawBody: Buffer, signature: string): ProviderWebhookEvent {

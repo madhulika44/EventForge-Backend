@@ -10,6 +10,7 @@ import { optionalAuth, requireAuth } from "../middleware/auth.middleware";
 import { validateBody, validateQuery } from "../middleware/validate.middleware";
 import { createEventSchema, listEventsQuerySchema, updateEventSchema } from "../schemas/event.schema";
 import ticketTypeRoutes from "./ticket-type.routes";
+import eventBookingRoutes from "./event-booking.routes";
 
 const router = Router();
 
@@ -20,5 +21,6 @@ router.patch("/:id", requireAuth, validateBody(updateEventSchema), updateEventHa
 router.delete("/:id", requireAuth, cancelEventHandler);
 
 router.use("/:eventId/ticket-types", ticketTypeRoutes);
+router.use("/:eventId/bookings", eventBookingRoutes);
 
 export default router;
